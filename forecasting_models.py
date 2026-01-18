@@ -2,12 +2,13 @@ import json
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 import warnings
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
+import os
 warnings.filterwarnings('ignore')
 
-# Time series forecasting libraries
+# Time series forecasting libraries - lazy loaded for heavy ones
 from statsmodels.tsa.holtwinters import ExponentialSmoothing, SimpleExpSmoothing
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -18,12 +19,47 @@ try:
 except ImportError:
     THETA_AVAILABLE = False
     ThetaModel = None
-import pmdarima as pm
-from prophet import Prophet
 from statsmodels.tsa.exponential_smoothing.ets import ETSModel
 
 # Metrics
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+
+# Lazy loading for heavy libraries (Prophet, pmdarima)
+_PROPHET_LOADED = False
+_PMDARIMA_LOADED = False
+Prophet = None
+pm = None
+
+def _lazy_load_prophet():
+    """Lazy load Prophet only when needed"""
+    global Prophet, _PROPHET_LOADED
+    if not _PROPHET_LOADED:
+        from prophet import Prophet
+        _PROPHET_LOADED = True
+    return Prophet
+
+def _lazy_load_pmdarima():
+    """Lazy load pmdarima only when needed"""
+    global pm, _PMDARIMA_LOADED
+    if not _PMDARIMA_LOADED:
+        import pmdarima as pm
+        _PMDARIMA_LOADED = True
+    return pm
+
+# Detect production environment (Render, Heroku, etc.)
+# Check for explicit fast mode setting, then check common production indicators
+FAST_MODE_ENV = os.environ.get('FAST_MODE', '').lower() in ('true', '1', 'yes')
+IS_PRODUCTION = (
+    FAST_MODE_ENV or 
+    os.environ.get('RENDER') == 'true' or 
+    os.environ.get('DYNO') is not None or
+    # Render sets PORT, and if we're not in a typical dev environment, assume production
+    (os.environ.get('PORT') is not None and os.environ.get('ENV') != 'development')
+)
+# Reduce parallel workers in production for better resource management
+MAX_PARALLEL_WORKERS = 3 if IS_PRODUCTION else 6
+# Model timeout in seconds (production gets shorter timeout)
+MODEL_TIMEOUT = 30 if IS_PRODUCTION else 60
 
 
 def calculate_rmse(actual: np.ndarray, predicted: np.ndarray) -> float:
@@ -388,10 +424,17 @@ def sarima_forecast(data: pd.Series, forecast_steps: int, seasonality: int = Non
 def auto_arima_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, Dict]:
     """Auto ARIMA using pmdarima - optimized for speed"""
     try:
+        pm = _lazy_load_pmdarima()
+        # Further reduce search space in production
+        max_p = 1 if IS_PRODUCTION else 2
+        max_d = 1 if IS_PRODUCTION else 2
+        max_q = 1 if IS_PRODUCTION else 2
+        maxiter = 30 if IS_PRODUCTION else 50
+        
         model = pm.auto_arima(data, seasonal=False, stepwise=True, 
                              suppress_warnings=True, error_action='ignore',
-                             max_p=2, max_d=2, max_q=2,  # Reduced search space
-                             maxiter=50,  # Limit iterations
+                             max_p=max_p, max_d=max_d, max_q=max_q,
+                             maxiter=maxiter,
                              n_jobs=1)  # Single thread for stability
         forecast = model.predict(forecast_steps)
         metadata = {
@@ -496,15 +539,23 @@ def theta_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, Di
 
 
 def prophet_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, Dict]:
-    """Prophet forecast"""
+    """Prophet forecast - optimized for production"""
     try:
+        Prophet = _lazy_load_prophet()
         # Prophet requires DataFrame with 'ds' and 'y' columns
         df = pd.DataFrame({
             'ds': pd.date_range(start='2020-01-01', periods=len(data), freq='D'),
             'y': data.values
         })
         
-        model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+        # Reduce seasonality options in production for speed
+        if IS_PRODUCTION:
+            model = Prophet(yearly_seasonality=True, weekly_seasonality=False, 
+                          daily_seasonality=False, n_changepoints=10)
+        else:
+            model = Prophet(yearly_seasonality=True, weekly_seasonality=True, 
+                          daily_seasonality=False)
+        
         model.fit(df)
         
         future = model.make_future_dataframe(periods=forecast_steps)
@@ -517,7 +568,7 @@ def prophet_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, 
             "components": {
                 "trend": True,
                 "yearly_seasonality": True,
-                "weekly_seasonality": True
+                "weekly_seasonality": not IS_PRODUCTION
             }
         }
         return forecast, metadata
@@ -623,7 +674,7 @@ def _evaluate_single_model(model_name: str, forecast_func, data: pd.Series, trai
 
 
 def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: List[str] = None, 
-                   skip_validation: bool = False, parallel: bool = True) -> List[Dict]:
+                   skip_validation: bool = False, parallel: bool = True, fast_mode: bool = None) -> List[Dict]:
     """Evaluate forecasting models - runs all models in parallel for speed
     
     Args:
@@ -632,8 +683,13 @@ def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: Li
         models_to_run: List of model names to run. If None, runs all models.
         skip_validation: If True, skip validation step (faster but no RMSE/MAPE)
         parallel: If True, run models in parallel (default: True)
+        fast_mode: If True, only run fast models. If None, auto-detect based on environment.
     """
     results = []
+    
+    # Auto-enable fast mode in production if not specified
+    if fast_mode is None:
+        fast_mode = IS_PRODUCTION
     
     # Setup validation split
     if skip_validation or len(data) < 20:
@@ -665,29 +721,53 @@ def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: Li
         ("Croston", croston_forecast),
     ]
     
+    # Fast models (skip slow ones in production)
+    fast_models = [
+        "Naive", "Seasonal Naive", "Moving Average", "SES", "Holt",
+        "Holt-Winters (Additive)", "Holt-Winters (Multiplicative)", 
+        "ARIMA", "ETS(A,A,A)"
+    ]
+    
     # Filter models if specified
     if models_to_run:
         forecast_functions = [(name, func) for name, func in all_forecast_functions if name in models_to_run]
+    elif fast_mode:
+        # In fast mode, skip slow models (Prophet, SARIMA, Auto ARIMA, Theta)
+        forecast_functions = [(name, func) for name, func in all_forecast_functions if name in fast_models]
     else:
         forecast_functions = all_forecast_functions
     
+    # Determine timeout per model (only for slow models)
+    slow_models = {"Prophet", "SARIMA", "AUTO ARIMA", "ETS(A,A,A)"}
+    
     # Run models in parallel for speed
     if parallel and len(forecast_functions) > 1:
-        with ThreadPoolExecutor(max_workers=min(len(forecast_functions), 6)) as executor:
+        max_workers = min(len(forecast_functions), MAX_PARALLEL_WORKERS)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
-            future_to_model = {
-                executor.submit(_evaluate_single_model, model_name, forecast_func, 
-                               data, train_data, test_data, forecast_steps, validation_mode): model_name
-                for model_name, forecast_func in forecast_functions
-            }
+            future_to_model = {}
+            for model_name, forecast_func in forecast_functions:
+                future = executor.submit(_evaluate_single_model, model_name, forecast_func, 
+                                        data, train_data, test_data, forecast_steps, 
+                                        validation_mode)
+                future_to_model[future] = model_name
             
-            # Collect results as they complete
+            # Collect results as they complete with timeout
             for future in as_completed(future_to_model):
+                model_name = future_to_model[future]
+                timeout = MODEL_TIMEOUT if model_name in slow_models else MODEL_TIMEOUT * 2
                 try:
-                    result = future.result()
+                    result = future.result(timeout=timeout)
                     results.append(result)
+                except FutureTimeoutError:
+                    results.append({
+                        "model_name": model_name,
+                        "metadata": {"error": f"Model execution timed out after {timeout}s", "timeout": True},
+                        "rmse": None,
+                        "mape": None,
+                        "forecast": None
+                    })
                 except Exception as e:
-                    model_name = future_to_model[future]
                     results.append({
                         "model_name": model_name,
                         "metadata": {"error": str(e)},
@@ -699,7 +779,8 @@ def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: Li
         # Sequential execution (fallback)
         for model_name, forecast_func in forecast_functions:
             result = _evaluate_single_model(model_name, forecast_func, data, 
-                                          train_data, test_data, forecast_steps, validation_mode)
+                                          train_data, test_data, forecast_steps, 
+                                          validation_mode)
             results.append(result)
     
     return results

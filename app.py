@@ -1,8 +1,9 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import json
+import os
 
 # Import all the forecasting functions from lambda_function
 from forecasting_models import (
@@ -39,18 +40,32 @@ def read_root():
     return {
         "message": "Time Series Forecasting API",
         "endpoint": "/forecast",
-        "method": "POST"
+        "method": "POST",
+        "health_check": "/health"
+    }
+
+
+@app.get("/health")
+def health_check():
+    """Lightweight health check endpoint that doesn't load heavy ML libraries"""
+    return {
+        "status": "healthy",
+        "service": "forecasting-api"
     }
 
 
 @app.post("/forecast")
-def forecast(request: ForecastRequest):
+def forecast(
+    request: ForecastRequest,
+    fast_mode: Optional[bool] = Query(None, description="Use fast mode (skip slow models). Auto-enabled in production.")
+):
     """
     Forecast time series data using multiple models
     
     - **data**: List of data points with date and value
     - **forecast_steps**: Number of steps to forecast (default: 12 months)
     - **models**: Optional list of model names to run. If not provided, runs all models.
+    - **fast_mode**: Optional query parameter to enable fast mode (skips slow models like Prophet, SARIMA)
     
     Returns:
     - **all_models**: List of all models with metadata (RMSE, MAPE) - only best model includes forecast
@@ -84,9 +99,15 @@ def forecast(request: ForecastRequest):
         skip_validation = False
         
         # If no models specified, run all models (parallel processing handles speed)
-        # Evaluate all models in parallel
-        all_results = evaluate_models(data_series, request.forecast_steps, models_to_run, 
-                                     skip_validation=skip_validation, parallel=True)
+        # Evaluate all models in parallel with fast_mode support
+        all_results = evaluate_models(
+            data_series, 
+            request.forecast_steps, 
+            models_to_run, 
+            skip_validation=skip_validation, 
+            parallel=True,
+            fast_mode=fast_mode
+        )
         
         # Select best model
         best_model = select_best_model(all_results)
