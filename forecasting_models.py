@@ -519,7 +519,7 @@ def croston_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, 
         return forecast, metadata
 
 
-def evaluate_models(data: pd.Series, forecast_steps: int = 1, models_to_run: List[str] = None) -> List[Dict]:
+def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: List[str] = None) -> List[Dict]:
     """Evaluate forecasting models
     
     Args:
