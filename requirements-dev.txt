@@ -1,0 +1,14 @@
+# For local development with Python 3.13+
+# Use: pip install -r requirements-dev.txt
+
+numpy>=2.0.0
+pandas>=2.1.0
+scikit-learn>=1.4.0
+statsmodels>=0.14.1
+pmdarima>=2.0.4
+prophet>=1.1.5
+scipy>=1.12.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+

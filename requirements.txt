@@ -1,0 +1,14 @@
+# Core ML libraries - compatible with Python 3.11+ (for deployment)
+numpy>=1.24.0,<2.0.0
+pandas>=2.0.0,<3.0.0
+scikit-learn>=1.3.0,<2.0.0
+statsmodels>=0.14.0,<1.0.0
+pmdarima>=2.0.0,<3.0.0
+prophet>=1.1.0,<2.0.0
+scipy>=1.11.0,<2.0.0
+
+# FastAPI
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.5.0
+
