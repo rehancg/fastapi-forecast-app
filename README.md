@@ -29,16 +29,59 @@ Once running, visit:
 
 ## Deploy to Render (Free)
 
-1. Push code to GitHub
-2. Go to https://render.com
-3. Click "New +" → "Web Service"
-4. Connect your GitHub repo
-5. Settings:
-   - Name: `forecasting-api`
-   - Environment: `Python 3`
-   - Build Command: `pip install -r requirements.txt`
-   - Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-6. Click "Create Web Service"
+### Option 1: Using render.yaml (Recommended)
+
+1. **Push code to GitHub:**
+   ```bash
+   git init
+   git add .
+   git commit -m "Initial commit"
+   git remote add origin <your-github-repo-url>
+   git push -u origin main
+   ```
+
+2. **Deploy on Render:**
+   - Go to https://render.com
+   - Sign up/login with GitHub
+   - Click "New +" → "Blueprint"
+   - Connect your GitHub repo
+   - Render will auto-detect `render.yaml` and deploy
+
+### Option 2: Manual Setup
+
+1. **Push code to GitHub** (same as above)
+
+2. **Create Web Service on Render:**
+   - Go to https://render.com
+   - Click "New +" → "Web Service"
+   - Connect your GitHub repo
+   - Select your repo
+
+3. **Configure Settings:**
+   - **Name**: `forecasting-api`
+   - **Environment**: `Python 3`
+   - **Region**: Choose closest to you
+   - **Branch**: `main` (or your default branch)
+   - **Root Directory**: Leave empty (or `.` if needed)
+   - **Build Command**: `pip install --upgrade pip && pip install -r requirements.txt`
+   - **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+   - **Python Version**: `3.11.0` (or leave auto)
+
+4. **Click "Create Web Service"**
+
+### Build & Deploy Commands:
+
+**Build Command:**
+```bash
+pip install --upgrade pip && pip install -r requirements.txt
+```
+
+**Start Command:**
+```bash
+uvicorn app:app --host 0.0.0.0 --port $PORT
+```
+
+**Note:** Render automatically sets the `$PORT` environment variable, so use it in the start command.
 
 ## Deploy to Railway (Free)
 
