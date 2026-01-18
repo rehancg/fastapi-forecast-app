@@ -78,14 +78,15 @@ def forecast(request: ForecastRequest):
                 detail='Insufficient data. Need at least 2 data points.'
             )
         
-        # Evaluate models (limit to faster models if not specified to avoid timeout)
+        # Evaluate all models - parallel processing makes it fast
         models_to_run = request.models
-        if models_to_run is None and len(data_series) > 50:
-            # For larger datasets, run faster models by default
-            models_to_run = ["Naive", "Seasonal Naive", "Moving Average", "SES", "Holt", "AUTO ARIMA"]
+        # Always run validation to properly compare models (parallel makes it fast)
+        skip_validation = False
         
-        # Evaluate all models
-        all_results = evaluate_models(data_series, request.forecast_steps, models_to_run)
+        # If no models specified, run all models (parallel processing handles speed)
+        # Evaluate all models in parallel
+        all_results = evaluate_models(data_series, request.forecast_steps, models_to_run, 
+                                     skip_validation=skip_validation, parallel=True)
         
         # Select best model
         best_model = select_best_model(all_results)

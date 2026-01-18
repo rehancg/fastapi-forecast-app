@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Tuple, Any
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 warnings.filterwarnings('ignore')
 
 # Time series forecasting libraries
@@ -222,17 +223,41 @@ def holt_winters_multiplicative_forecast(data: pd.Series, forecast_steps: int, s
 
 
 def arima_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, Dict]:
-    """ARIMA with AIC-based order selection"""
+    """ARIMA with AIC-based order selection - optimized for speed"""
     try:
-        # Grid search for best ARIMA order
+        # Reduced search space for faster execution
         best_aic = np.inf
         best_order = (1, 1, 1)
         best_model = None
         
-        # Limited search space for Lambda constraints
-        for p in range(0, 4):
-            for d in range(0, 3):
-                for q in range(0, 4):
+        # Optimized: Try common orders first, then limited grid
+        common_orders = [(1, 1, 1), (2, 1, 2), (1, 1, 0), (0, 1, 1), (1, 0, 1)]
+        for order in common_orders:
+            try:
+                model = ARIMA(data, order=order).fit()
+                if model.aic < best_aic:
+                    best_aic = model.aic
+                    best_order = order
+                    best_model = model
+            except:
+                continue
+        
+        # If common orders work, skip grid search for speed
+        if best_model is not None and best_aic < np.inf:
+            forecast = best_model.forecast(forecast_steps)
+            metadata = {
+                "model": "ARIMA",
+                "order": best_order,
+                "aic": float(best_aic)
+            }
+            return forecast.values, metadata
+        
+        # Limited grid search only if needed
+        for p in range(0, 3):
+            for d in range(0, 2):
+                for q in range(0, 3):
+                    if (p, d, q) in common_orders:
+                        continue
                     try:
                         model = ARIMA(data, order=(p, d, q)).fit()
                         if model.aic < best_aic:
@@ -282,21 +307,55 @@ def sarima_forecast(data: pd.Series, forecast_steps: int, seasonality: int = Non
         return forecast, metadata
     
     try:
-        # Limited search space
+        # Optimized: Try common SARIMA orders first
         best_aic = np.inf
         best_order = (1, 1, 1)
         best_seasonal_order = (1, 1, 1, seasonality)
         best_model = None
         
-        for p in range(0, 3):
+        # Common SARIMA orders - try these first
+        common_orders = [
+            ((1, 1, 1), (1, 1, 1)),
+            ((1, 1, 0), (1, 1, 0)),
+            ((0, 1, 1), (0, 1, 1)),
+            ((1, 1, 1), (0, 1, 1)),
+        ]
+        
+        for (p, d, q), (P, D, Q) in common_orders:
+            try:
+                model = SARIMAX(data, order=(p, d, q), 
+                               seasonal_order=(P, D, Q, seasonality)).fit(disp=False, maxiter=50)
+                if model.aic < best_aic:
+                    best_aic = model.aic
+                    best_order = (p, d, q)
+                    best_seasonal_order = (P, D, Q, seasonality)
+                    best_model = model
+            except:
+                continue
+        
+        # If common orders work, skip extensive grid search
+        if best_model is not None and best_aic < np.inf:
+            forecast = best_model.forecast(forecast_steps)
+            metadata = {
+                "model": "SARIMA",
+                "order": best_order,
+                "seasonal_order": best_seasonal_order,
+                "aic": float(best_aic)
+            }
+            return forecast.values, metadata
+        
+        # Limited grid search only if needed (reduced space)
+        for p in range(0, 2):
             for d in range(0, 2):
-                for q in range(0, 3):
+                for q in range(0, 2):
                     for P in range(0, 2):
                         for D in range(0, 2):
                             for Q in range(0, 2):
+                                if ((p, d, q), (P, D, Q)) in common_orders:
+                                    continue
                                 try:
                                     model = SARIMAX(data, order=(p, d, q), 
-                                                   seasonal_order=(P, D, Q, seasonality)).fit(disp=False)
+                                                   seasonal_order=(P, D, Q, seasonality)).fit(disp=False, maxiter=50)
                                     if model.aic < best_aic:
                                         best_aic = model.aic
                                         best_order = (p, d, q)
@@ -327,11 +386,13 @@ def sarima_forecast(data: pd.Series, forecast_steps: int, seasonality: int = Non
 
 
 def auto_arima_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, Dict]:
-    """Auto ARIMA using pmdarima"""
+    """Auto ARIMA using pmdarima - optimized for speed"""
     try:
         model = pm.auto_arima(data, seasonal=False, stepwise=True, 
                              suppress_warnings=True, error_action='ignore',
-                             max_p=3, max_d=2, max_q=3)
+                             max_p=2, max_d=2, max_q=2,  # Reduced search space
+                             maxiter=50,  # Limit iterations
+                             n_jobs=1)  # Single thread for stability
         forecast = model.predict(forecast_steps)
         metadata = {
             "model": "AUTO ARIMA",
@@ -519,28 +580,72 @@ def croston_forecast(data: pd.Series, forecast_steps: int) -> Tuple[np.ndarray, 
         return forecast, metadata
 
 
-def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: List[str] = None) -> List[Dict]:
-    """Evaluate forecasting models
+def _evaluate_single_model(model_name: str, forecast_func, data: pd.Series, train_data: pd.Series, 
+                          test_data: pd.Series, forecast_steps: int, validation_mode: bool) -> Dict:
+    """Evaluate a single model - used for parallel processing"""
+    try:
+        # Generate forecast for validation period
+        if validation_mode and len(test_data) > 0:
+            val_forecast, metadata = forecast_func(train_data, len(test_data))
+            # Calculate metrics
+            rmse = calculate_rmse(test_data.values, val_forecast)
+            mape = calculate_mape(test_data.values, val_forecast)
+        else:
+            # No validation, set metrics to None
+            metadata = {}
+            rmse = None
+            mape = None
+        
+        # Generate final forecast using all data
+        final_forecast, final_metadata = forecast_func(data, forecast_steps)
+        # Merge metadata
+        if metadata:
+            final_metadata.update(metadata)
+        
+        result = {
+            "model_name": model_name,
+            "metadata": final_metadata,
+            "rmse": float(rmse) if rmse is not None and not np.isinf(rmse) else None,
+            "mape": float(mape) if mape is not None and not np.isinf(mape) else None,
+            "forecast": final_forecast.tolist() if isinstance(final_forecast, np.ndarray) else list(final_forecast)
+        }
+        return result
+        
+    except Exception as e:
+        # If model fails completely, still add it with error
+        return {
+            "model_name": model_name,
+            "metadata": {"error": str(e)},
+            "rmse": None,
+            "mape": None,
+            "forecast": None
+        }
+
+
+def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: List[str] = None, 
+                   skip_validation: bool = False, parallel: bool = True) -> List[Dict]:
+    """Evaluate forecasting models - runs all models in parallel for speed
     
     Args:
         data: Time series data
         forecast_steps: Number of steps to forecast
         models_to_run: List of model names to run. If None, runs all models.
+        skip_validation: If True, skip validation step (faster but no RMSE/MAPE)
+        parallel: If True, run models in parallel (default: True)
     """
     results = []
     
-    # Split data for validation
-    split_idx = int(len(data) * 0.8)
-    train_data = data.iloc[:split_idx]
-    test_data = data.iloc[split_idx:]
-    
-    if len(test_data) == 0:
-        # If not enough data, use all for training and skip validation
+    # Setup validation split
+    if skip_validation or len(data) < 20:
+        validation_mode = False
         train_data = data
         test_data = pd.Series(dtype=float)
-        validation_mode = False
     else:
-        validation_mode = True
+        # Use 70/30 split for faster validation
+        split_idx = int(len(data) * 0.7)
+        train_data = data.iloc[:split_idx]
+        test_data = data.iloc[split_idx:]
+        validation_mode = len(test_data) > 0
     
     # List of all forecast functions
     all_forecast_functions = [
@@ -566,41 +671,35 @@ def evaluate_models(data: pd.Series, forecast_steps: int = 12, models_to_run: Li
     else:
         forecast_functions = all_forecast_functions
     
-    for model_name, forecast_func in forecast_functions:
-        try:
-            # Generate forecast for validation period
-            if validation_mode:
-                val_forecast, metadata = forecast_func(train_data, len(test_data))
-                # Calculate metrics
-                rmse = calculate_rmse(test_data.values, val_forecast)
-                mape = calculate_mape(test_data.values, val_forecast)
-            else:
-                # No validation, set metrics to None
-                val_forecast, metadata = forecast_func(train_data, forecast_steps)
-                rmse = None
-                mape = None
-            
-            # Generate final forecast using all data
-            final_forecast, _ = forecast_func(data, forecast_steps)
-            
-            result = {
-                "model_name": model_name,
-                "metadata": metadata,
-                "rmse": float(rmse) if rmse is not None and not np.isinf(rmse) else None,
-                "mape": float(mape) if mape is not None and not np.isinf(mape) else None,
-                "forecast": final_forecast.tolist() if isinstance(final_forecast, np.ndarray) else list(final_forecast)
+    # Run models in parallel for speed
+    if parallel and len(forecast_functions) > 1:
+        with ThreadPoolExecutor(max_workers=min(len(forecast_functions), 6)) as executor:
+            # Submit all tasks
+            future_to_model = {
+                executor.submit(_evaluate_single_model, model_name, forecast_func, 
+                               data, train_data, test_data, forecast_steps, validation_mode): model_name
+                for model_name, forecast_func in forecast_functions
             }
-            results.append(result)
             
-        except Exception as e:
-            # If model fails completely, still add it with error
-            result = {
-                "model_name": model_name,
-                "metadata": {"error": str(e)},
-                "rmse": None,
-                "mape": None,
-                "forecast": None
-            }
+            # Collect results as they complete
+            for future in as_completed(future_to_model):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    model_name = future_to_model[future]
+                    results.append({
+                        "model_name": model_name,
+                        "metadata": {"error": str(e)},
+                        "rmse": None,
+                        "mape": None,
+                        "forecast": None
+                    })
+    else:
+        # Sequential execution (fallback)
+        for model_name, forecast_func in forecast_functions:
+            result = _evaluate_single_model(model_name, forecast_func, data, 
+                                          train_data, test_data, forecast_steps, validation_mode)
             results.append(result)
     
     return results
